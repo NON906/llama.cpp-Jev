@@ -19,6 +19,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cmath>
 #include <cinttypes>
 #include <exception>
 #include <memory>
@@ -2384,6 +2385,7 @@ private:
             case SERVER_TASK_TYPE_INFILL:
             case SERVER_TASK_TYPE_EMBEDDING:
             case SERVER_TASK_TYPE_RERANK:
+            case SERVER_TASK_TYPE_SYSTEMONE:
                 {
                     // special case: if input is provided via CLI, tokenize it first
                     // otherwise, no need to tokenize as it's already done inside the HTTP thread
@@ -3816,6 +3818,25 @@ private:
             }
 
             if (slot.state == SLOT_STATE_DONE_PROMPT) {
+                if (slot.task->type == SERVER_TASK_TYPE_SYSTEMONE) {
+                    const float * logits = llama_get_logits_ith(ctx_tgt, slot.i_batch - off);
+                    if (!logits) {
+                        send_error(slot, "Failed to read systemone logits", ERROR_TYPE_SERVER);
+                    } else {
+                        auto result = std::make_unique<server_task_result_systemone>();
+                        result->id = slot.task->id;
+                        result->index = slot.task->index;
+                        result->n_tokens = slot.task->n_tokens();
+                        for (llama_token token : slot.task->systemone_tokens) {
+                            result->logits.push_back(logits[token]);
+                        }
+                        queue_results.send(std::move(result));
+                    }
+                    slot.release();
+                    slot.i_batch = -1;
+                    return;
+                }
+
                 if (slot.task->type == SERVER_TASK_TYPE_EMBEDDING) {
                     // prompt evaluated for embedding
                     send_embedding(slot, batch_view);
@@ -4253,6 +4274,183 @@ void server_context::set_state_callback(server_state_callback_t callback) {
 //
 // server_routes
 //
+
+struct systemone_question {
+    std::string name;
+    std::string type;
+    json instructions;
+    std::vector<std::string> keys;
+    std::vector<json> descriptions;
+
+    static void validate_value(const json & value) {
+        if (!value.is_string() && !value.is_object() && !value.is_array() && !value.is_null()) {
+            throw std::invalid_argument("systemone values must be strings, objects, arrays or null");
+        }
+    }
+
+    static std::vector<systemone_question> parse(const json & body) {
+        if (!body.is_object() || !body.contains("state") || !body.contains("questions")) {
+            throw std::invalid_argument("systemone requires state and questions");
+        }
+        validate_value(body.at("state"));
+        if (!body.at("questions").is_object()) {
+            throw std::invalid_argument("questions must be an object");
+        }
+        if (body.contains("model") && (!body.at("model").is_string() || body.at("model").get<std::string>().empty())) {
+            throw std::invalid_argument("model must be a non-empty string");
+        }
+        for (const auto & field : body.items()) {
+            if (field.key() != "state" && field.key() != "questions" && field.key() != "model") {
+                throw std::invalid_argument("Unknown systemone field: " + field.key());
+            }
+        }
+        std::vector<systemone_question> result;
+        for (const auto & item : body.at("questions").items()) {
+            const auto & value = item.value();
+            if (item.key().empty() || !value.is_object() || !value.contains("type") || !value.at("type").is_string() || !value.contains("instructions")) {
+                throw std::invalid_argument("Each named question requires type and instructions");
+            }
+            for (const auto & field : value.items()) {
+                if (field.key() != "type" && field.key() != "instructions" && field.key() != "criteria") {
+                    throw std::invalid_argument("Unknown question field: " + field.key());
+                }
+            }
+            systemone_question question;
+            question.name = item.key();
+            question.type = value.at("type").get<std::string>();
+            question.instructions = value.at("instructions");
+            validate_value(question.instructions);
+            const json criteria = value.value("criteria", json());
+            if (question.type == "noul") {
+                if (!criteria.is_null() && !criteria.is_object()) {
+                    throw std::invalid_argument("noul criteria must be an object or null");
+                }
+                if (criteria.is_object()) {
+                    for (const auto & criterion : criteria.items()) {
+                        if (criterion.key() != "true" && criterion.key() != "false") {
+                            throw std::invalid_argument("noul criteria accepts only true and false");
+                        }
+                    }
+                }
+                question.keys = {"yes", "no"};
+                for (const auto & key : {"true", "false"}) {
+                    question.descriptions.push_back(criteria.is_object() ? criteria.value(key, json()) : json());
+                }
+            } else if (question.type == "choice" || question.type == "score") {
+                const bool score = question.type == "score";
+                if ((score && !criteria.is_array()) || (!score && !criteria.is_object()) || criteria.size() < (score ? 2u : 1u) || criteria.size() > 26) {
+                    throw std::invalid_argument("choice criteria must contain 1-26 object entries; score criteria must contain 2-26 array entries");
+                }
+                for (const auto & criterion : criteria.items()) {
+                    question.keys.push_back(score ? std::to_string(question.keys.size()) : criterion.key());
+                    question.descriptions.push_back(criterion.value());
+                }
+            } else {
+                throw std::invalid_argument("Question type must be choice, score or noul");
+            }
+            for (const auto & description : question.descriptions) {
+                validate_value(description);
+            }
+            result.push_back(std::move(question));
+        }
+        return result;
+    }
+
+    json messages(const json & state, bool allow_image, bool allow_audio) const {
+        json evidence = state;
+        json content = json::array();
+        if (state.is_object() && state.contains("content") && state.at("content").is_array()) {
+            content = state.at("content");
+            evidence.erase("content");
+            for (const auto & part : content) {
+                if (!part.is_object() || !part.contains("type") || !part.at("type").is_string()) {
+                    throw std::invalid_argument("state.content requires typed content parts");
+                }
+                const std::string type = part.at("type");
+                if (type == "text") {
+                    if (!part.contains("text") || !part.at("text").is_string()) {
+                        throw std::invalid_argument("text content requires a text string");
+                    }
+                } else if (type == "image_url" || type == "input_audio") {
+                    if ((type == "image_url" && !allow_image) || (type == "input_audio" && !allow_audio)) {
+                        throw std::invalid_argument("state media is not supported by the loaded model; use a matching model and --mmproj");
+                    }
+                    if (!part.contains(type) || !part.at(type).is_object()) {
+                        throw std::invalid_argument("Media content requires an image_url or input_audio object");
+                    }
+                    const auto & media = part.at(type);
+                    const char * key = type == "input_audio" && media.contains("data") ? "data" : "url";
+                    if (!media.contains(key) || !media.at(key).is_string() || media.at(key).get<std::string>().empty()) {
+                        throw std::invalid_argument("Media content requires a non-empty URL or base64 data string");
+                    }
+                } else {
+                    throw std::invalid_argument("state.content supports text, image_url and input_audio only");
+                }
+            }
+        }
+        json options = json::array();
+        for (size_t i = 0; i < keys.size(); ++i) {
+            json description = descriptions[i];
+            if (type == "noul") {
+                description = {{"answer", keys[i]}, {"criterion", descriptions[i]}};
+            }
+            options.push_back({{"letter", std::string(1, char('A' + i))}, {"description", description}});
+        }
+        const json payload = {{"evidence", evidence}, {"criterion", instructions}, {"options", options}};
+        json user_content = payload.dump();
+        if (!content.empty()) {
+            content.push_back({{"type", "text"}, {"text", payload.dump()}});
+            user_content = std::move(content);
+        }
+        return json::array({
+            {{"role", "system"}, {"content", "Apply the supplied criterion to the supplied evidence. Choose exactly one listed option. Respond with only its uppercase letter, with no explanation or reasoning."}},
+            {{"role", "user"}, {"content", user_content}},
+        });
+    }
+
+    json answer(const std::vector<float> & logits) const {
+        if (logits.size() != keys.size()) {
+            throw std::runtime_error("Invalid systemone logit count");
+        }
+        const size_t best = std::max_element(logits.begin(), logits.end()) - logits.begin();
+        std::vector<double> probabilities;
+        double total = 0.0;
+        for (float logit : logits) {
+            if (!std::isfinite(logit)) {
+                throw std::runtime_error("Non-finite systemone logits");
+            }
+            const double weight = std::exp(double(logit) - logits[best]);
+            probabilities.push_back(weight);
+            total += weight;
+        }
+        for (double & probability : probabilities) {
+            probability /= total;
+        }
+        if (type == "noul") {
+            return {{"type", type}, {"noul", (probabilities[0] + 1.0 - probabilities[1]) * 0.5}};
+        }
+        json output = {{"type", type}, {"probabilities", json::object()}};
+        double confidence = probabilities[best];
+        double score = 0.0;
+        for (size_t i = 0; i < keys.size(); ++i) {
+            output["probabilities"][keys[i]] = probabilities[i];
+            score += i * probabilities[i];
+            if (i != best) {
+                confidence *= 1.0 - probabilities[i];
+            }
+            if (type == "score") {
+                output["legend"][keys[i]] = descriptions[i].is_string() ? descriptions[i].get<std::string>() : descriptions[i].dump();
+            }
+        }
+        output["confidence"] = confidence;
+        if (type == "score") {
+            output["score"] = score;
+        } else {
+            output["choice"] = keys[best];
+        }
+        return output;
+    }
+};
 
 std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             const server_http_req & req,
@@ -5142,6 +5340,69 @@ void server_routes::init_routes() {
 
     this->post_embeddings_oai = [this](const server_http_req & req) {
         return handle_embeddings_impl(req, TASK_RESPONSE_TYPE_OAI_EMBD);
+    };
+
+    this->post_systemone = [this](const server_http_req & req) {
+        auto res = create_response();
+        if (params.embedding) {
+            res->error(format_error_response("systemone requires a causal language model without --embedding or --reranking", ERROR_TYPE_NOT_SUPPORTED));
+            return res;
+        }
+        const json body = json::parse(req.body);
+        const auto questions = systemone_question::parse(body);
+        auto & rd = res->rd;
+        std::vector<server_task> tasks;
+        for (const auto & question : questions) {
+            json chat = {
+                {"messages", question.messages(body.at("state"), meta->has_inp_image, meta->has_inp_audio)},
+                {"chat_template_kwargs", {{"enable_thinking", false}}},
+            };
+            std::vector<raw_buffer> files;
+            const json parsed = oaicompat_chat_params_parse(chat, meta->chat_params, files);
+            const std::string prompt = parsed.at("prompt");
+            const auto prefix = common_tokenize(ctx_server.vocab, prompt, true, true);
+            server_task task(SERVER_TASK_TYPE_SYSTEMONE);
+            task.id = rd.get_new_id();
+            task.params.cache_prompt = false;
+            for (size_t i = 0; i < question.keys.size(); ++i) {
+                const std::string label(1, char('A' + i));
+                const auto extended = common_tokenize(ctx_server.vocab, prompt + label, true, true);
+                if (extended.size() != prefix.size() + 1 || !std::equal(prefix.begin(), prefix.end(), extended.begin()) ||
+                    common_token_to_piece(ctx_server.vocab, extended.back()) != label ||
+                    std::find(task.systemone_tokens.begin(), task.systemone_tokens.end(), extended.back()) != task.systemone_tokens.end()) {
+                    throw std::invalid_argument("Answer label " + label + " is not a distinct single token at the answer boundary for this model and chat template");
+                }
+                task.systemone_tokens.push_back(extended.back());
+            }
+            if (ctx_server.mctx) {
+                task.tokens = process_mtmd_prompt(ctx_server.mctx, prompt, files, ctx_server.init_opt);
+            } else {
+                task.tokens = std::move(tokenize_input_prompts(ctx_server.vocab, nullptr, prompt, true, true, ctx_server.init_opt)[0]);
+            }
+            if (task.tokens.empty() || task.n_tokens() >= meta->slot_n_ctx) {
+                throw std::invalid_argument("systemone prompt is empty or exceeds the slot context; increase --ctx-size");
+            }
+            tasks.push_back(std::move(task));
+        }
+        rd.post_tasks(std::move(tasks));
+        auto results = rd.wait_for_all(req.should_stop);
+        if (results.is_terminated) {
+            return res;
+        }
+        if (results.error) {
+            res->error(results.error->to_json());
+            return res;
+        }
+        json answers = json::object();
+        int64_t input_tokens = 0;
+        for (const auto & result : results.results) {
+            const auto * scored = dynamic_cast<const server_task_result_systemone *>(result.get());
+            GGML_ASSERT(scored != nullptr);
+            answers[questions[scored->index].name] = questions[scored->index].answer(scored->logits);
+            input_tokens += scored->n_tokens;
+        }
+        res->ok({{"model", meta->model_name}, {"answers", answers}, {"usage", {{"input_tokens", input_tokens}, {"output_tokens", 0}}}});
+        return res;
     };
 
     this->post_rerank = [this](const server_http_req & req) {

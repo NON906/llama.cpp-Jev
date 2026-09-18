@@ -60,6 +60,28 @@ def test_v1_models_supports_multimodal_capability():
     assert "completion" in model_info["capabilities"]
     assert "multimodal" in model_info["capabilities"]
 
+
+def test_systemone_image_state():
+    server.n_ctx = 4096
+    server.start()
+    results = []
+    for image_id in ("IMG_BASE64_URI_0", "IMG_BASE64_URI_1"):
+        res = server.make_request("POST", "/v1/systemone", data={
+            "state": {"content": [
+                {"type": "image_url", "image_url": {"url": get_img_url(image_id)}},
+                {"type": "text", "text": "Classify the picture."},
+            ]},
+            "questions": {"subject": {"type": "choice", "instructions": "What is shown?", "criteria": {"truck": "A truck", "cat": "A cat"}}},
+        })
+        assert res.status_code == 200, res.body
+        probabilities = res.body["answers"]["subject"]["probabilities"]
+        assert set(probabilities) == {"truck", "cat"}
+        assert sum(probabilities.values()) == pytest.approx(1)
+        assert res.body["usage"]["input_tokens"] > 0
+        assert res.body["usage"]["output_tokens"] == 0
+        results.append(probabilities)
+    assert results[0] != results[1]
+
 @pytest.mark.parametrize(
     "prompt, image_url, success, re_content",
     [

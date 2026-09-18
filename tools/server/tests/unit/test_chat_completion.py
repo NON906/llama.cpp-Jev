@@ -10,6 +10,188 @@ def create_server():
     server = ServerPreset.tinyllama2()
 
 
+@pytest.mark.parametrize("state", ["A delayed payment", {"ticket": {"message": "A delayed payment"}}])
+def test_systemone_answers(state):
+    import math
+
+    server.n_ctx = 4096
+    server.start()
+    questions = {
+        "team": {"type": "choice", "instructions": "Choose a team", "criteria": {"billing": "Payments", "support": "Other"}},
+        "severity": {"type": "score", "instructions": "Rate severity", "criteria": ["Low", "Medium", "High"]},
+        "urgent": {"type": "noul", "instructions": "Is this urgent?"},
+    }
+    body = {"state": state, "questions": questions}
+    res = server.make_request("POST", "/v1/systemone", data=body)
+    assert res.status_code == 200, res.body
+    assert res.body["usage"]["input_tokens"] > 0
+    assert res.body["usage"]["output_tokens"] == 0
+    assert res.body["model"] == server.model_alias
+    answers = res.body["answers"]
+    assert set(answers) == set(questions)
+    for name in ("team", "severity"):
+        answer = answers[name]
+        probabilities = answer["probabilities"]
+        assert sum(probabilities.values()) == pytest.approx(1)
+        assert all(math.isfinite(p) and 0 <= p <= 1 for p in probabilities.values())
+        best = max(probabilities, key=probabilities.get)
+        confidence = probabilities[best] * math.prod(1 - p for k, p in probabilities.items() if k != best)
+        assert answer["confidence"] == pytest.approx(confidence)
+        if name == "team":
+            assert answer["choice"] == best
+        else:
+            assert answer["score"] == pytest.approx(sum(int(k) * p for k, p in probabilities.items()))
+            assert answer["legend"] == {"0": "Low", "1": "Medium", "2": "High"}
+    assert set(answers["urgent"]) == {"type", "noul"}
+    assert 0 <= answers["urgent"]["noul"] <= 1
+    repeated = server.make_request("POST", "/v1/systemone", data=body)
+    assert repeated.status_code == 200, repeated.body
+    for name in answers:
+        field = "noul" if name == "urgent" else "confidence"
+        assert repeated.body["answers"][name][field] == pytest.approx(answers[name][field], abs=1e-5)
+    ordinary = server.make_request("POST", "/completion", data={"prompt": "Once upon a time", "n_predict": 2})
+    assert ordinary.status_code == 200
+    assert ordinary.body["tokens_predicted"] == 2
+
+
+def test_systemone_26_candidates():
+    server.n_ctx = 8192
+    server.start()
+    criteria = [f"Level {i}" for i in range(26)]
+    res = server.make_request("POST", "/v1/systemone", data={
+        "state": {"content": [{"type": "text", "text": "Level 25"}], "source": "test"},
+        "questions": {"level": {"type": "score", "instructions": "Select the level", "criteria": criteria}},
+    })
+    assert res.status_code == 200, res.body
+    answer = res.body["answers"]["level"]
+    assert set(answer["probabilities"]) == {str(i) for i in range(26)}
+    assert sum(answer["probabilities"].values()) == pytest.approx(1)
+    assert 0 <= answer["score"] <= 25
+    assert answer["legend"]["25"] == "Level 25"
+
+
+@pytest.mark.parametrize("question", [
+    {"type": "choice", "instructions": "Pick", "criteria": {}},
+    {"type": "choice", "instructions": "Pick", "criteria": {str(i): "x" for i in range(27)}},
+    {"type": "score", "instructions": "Rate", "criteria": ["Only"]},
+    {"type": "score", "instructions": "Rate", "criteria": {"0": "Low", "1": "High"}},
+    {"type": "noul", "instructions": "Check", "criteria": {"yes": "Wrong key"}},
+    {"type": "noul", "instructions": 1},
+    {"type": "unknown", "instructions": "Check"},
+])
+def test_systemone_invalid_question(question):
+    server.start()
+    res = server.make_request("POST", "/v1/systemone", data={"state": "Test", "questions": {"q": question}})
+    assert res.status_code == 400, res.body
+
+
+@pytest.mark.parametrize("part", [
+    {"type": "image_url", "image_url": {"url": "data:image/png;base64,aA=="}},
+    {"type": "input_audio", "input_audio": {"data": "aA==", "format": "wav"}},
+    {"type": "unknown"},
+])
+def test_systemone_reject_unsupported_media(part):
+    server.start()
+    res = server.make_request("POST", "/v1/systemone", data={
+        "state": {"content": [part]},
+        "questions": {"q": {"type": "noul", "instructions": "Check"}},
+    })
+    assert res.status_code == 400, res.body
+
+
+@pytest.mark.parametrize("question_type", ["choice", "score", "noul"])
+def test_systemone_matches_native_probabilities(question_type):
+    import math
+
+    server.n_ctx = 4096
+    server.start()
+    descriptions = [{"answer": "yes", "criterion": None}, {"answer": "no", "criterion": None}] if question_type == "noul" else ["Urgent", "Not urgent"]
+    payload = {"evidence": "A delayed payment", "criterion": "Is this urgent?", "options": [
+        {"letter": chr(65 + i), "description": description} for i, description in enumerate(descriptions)
+    ]}
+    messages = [
+        {"role": "system", "content": "Apply the supplied criterion to the supplied evidence. Choose exactly one listed option. Respond with only its uppercase letter, with no explanation or reasoning."},
+        {"role": "user", "content": json.dumps(payload, separators=(",", ":"))},
+    ]
+    formatted = server.make_request("POST", "/apply-template", data={"messages": messages, "chat_template_kwargs": {"enable_thinking": False}})
+    assert formatted.status_code == 200, formatted.body
+    prompt = formatted.body["prompt"]
+    ids = []
+    for letter in ("A", "B"):
+        tokenized = server.make_request("POST", "/tokenize", data={"content": prompt + letter, "add_special": True, "parse_special": True})
+        ids.append(tokenized.body["tokens"][-1])
+    reference = server.make_request("POST", "/completion", data={
+        "prompt": prompt, "n_predict": 1, "n_probs": 100000, "temperature": 1.0, "post_sampling_probs": False,
+    })
+    assert reference.status_code == 200, reference.body
+    probs = {p["id"]: math.exp(p["logprob"]) for p in reference.body["completion_probabilities"][0]["top_logprobs"]}
+    total = sum(probs[token] for token in ids)
+    expected = [probs[token] / total for token in ids]
+    question = {"type": question_type, "instructions": "Is this urgent?"}
+    if question_type == "choice":
+        question["criteria"] = {"yes": "Urgent", "no": "Not urgent"}
+    elif question_type == "score":
+        question["criteria"] = descriptions
+    result = server.make_request("POST", "/v1/systemone", data={
+        "state": "A delayed payment", "questions": {"q": question},
+    })
+    assert result.status_code == 200, result.body
+    answer = result.body["answers"]["q"]
+    if question_type == "noul":
+        assert answer["noul"] == pytest.approx((expected[0] + 1 - expected[1]) * 0.5, abs=1e-5)
+    else:
+        keys = ["yes", "no"] if question_type == "choice" else ["0", "1"]
+        assert [answer["probabilities"][key] for key in keys] == pytest.approx(expected, abs=1e-5)
+
+
+def test_systemone_validation_and_structured_criteria():
+    server.n_ctx = 4096
+    server.start()
+    question = {"q": {"type": "noul", "instructions": "Check"}}
+    for body in [
+        [], {}, {"questions": question}, {"state": 1, "questions": question},
+        {"state": "Test", "questions": []}, {"state": "Test", "questions": question, "stream": True},
+        {"state": "Test", "questions": {"": question["q"]}},
+        {"state": "Test", "questions": question, "model": 1},
+        {"state": "word " * 10000, "questions": question},
+    ]:
+        res = server.make_request("POST", "/v1/systemone", data=body)
+        assert res.status_code == 400, res.body
+    empty = server.make_request("POST", "/v1/systemone", data={"state": "Test", "questions": {}})
+    assert empty.status_code == 200, empty.body
+    assert empty.body["answers"] == {}
+    assert empty.body["usage"] == {"input_tokens": 0, "output_tokens": 0}
+    res = server.make_request("POST", "/v1/systemone", data={
+        "state": ["Test"], "questions": {
+            "only": {"type": "choice", "instructions": {"task": "Pick"}, "criteria": {"single": None}},
+            "score": {"type": "score", "instructions": ["Rate"], "criteria": [{"level": 0}, ["high"]]},
+            "noul": {"type": "noul", "instructions": None, "criteria": {"true": {"rule": "Valid"}}},
+        },
+    })
+    assert res.status_code == 200, res.body
+    assert res.body["answers"]["only"] == {"type": "choice", "choice": "single", "probabilities": {"single": 1}, "confidence": 1}
+    assert res.body["answers"]["score"]["legend"] == {"0": '{"level":0}', "1": '["high"]'}
+
+
+def test_systemone_concurrent_requests():
+    server.n_ctx = 4096
+    server.start()
+
+    def evaluate(index):
+        return server.make_request("POST", "/v1/systemone", data={
+            "state": "Test", "questions": {
+                str(index): {"type": "choice", "instructions": "Pick", "criteria": {"a": "First", "b": "Second"}},
+            },
+        })
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        results = list(pool.map(evaluate, range(4)))
+    for i, result in enumerate(results):
+        assert result.status_code == 200, result.body
+        assert set(result.body["answers"]) == {str(i)}
+        assert result.body["answers"][str(i)]["probabilities"] == pytest.approx(results[0].body["answers"]["0"]["probabilities"], abs=1e-5)
+
+
 @pytest.mark.parametrize(
     "model,system_prompt,user_prompt,max_tokens,re_content,n_prompt,n_predicted,finish_reason,jinja,chat_template",
     [
