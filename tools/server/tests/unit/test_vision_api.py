@@ -67,6 +67,7 @@ def test_systemone_image_state():
     results = []
     for image_id in ("IMG_BASE64_URI_0", "IMG_BASE64_URI_1"):
         res = server.make_request("POST", "/v1/systemone", data={
+            "model": server.model_alias,
             "state": {"content": [
                 {"type": "image_url", "image_url": {"url": get_img_url(image_id)}},
                 {"type": "text", "text": "Classify the picture."},

@@ -21,7 +21,7 @@ def test_systemone_answers(state):
         "severity": {"type": "score", "instructions": "Rate severity", "criteria": ["Low", "Medium", "High"]},
         "urgent": {"type": "noul", "instructions": "Is this urgent?"},
     }
-    body = {"state": state, "questions": questions}
+    body = {"model": server.model_alias, "state": state, "questions": questions}
     res = server.make_request("POST", "/v1/systemone", data=body)
     assert res.status_code == 200, res.body
     assert res.body["usage"]["input_tokens"] > 0
@@ -59,6 +59,7 @@ def test_systemone_26_candidates():
     server.start()
     criteria = [f"Level {i}" for i in range(26)]
     res = server.make_request("POST", "/v1/systemone", data={
+        "model": server.model_alias,
         "state": {"content": [{"type": "text", "text": "Level 25"}], "source": "test"},
         "questions": {"level": {"type": "score", "instructions": "Select the level", "criteria": criteria}},
     })
@@ -81,34 +82,41 @@ def test_systemone_26_candidates():
 ])
 def test_systemone_invalid_question(question):
     server.start()
-    res = server.make_request("POST", "/v1/systemone", data={"state": "Test", "questions": {"q": question}})
-    assert res.status_code == 400, res.body
+    res = server.make_request("POST", "/v1/systemone", data={"model": server.model_alias, "state": "Test", "questions": {"q": question}})
+    assert res.status_code == 422, res.body
+    assert "questions.q" in res.body["error"]["message"]
 
 
 @pytest.mark.parametrize("part", [
     {"type": "image_url", "image_url": {"url": "data:image/png;base64,aA=="}},
     {"type": "input_audio", "input_audio": {"data": "aA==", "format": "wav"}},
-    {"type": "unknown"},
+    {"type": "input_video", "input_video": {"data": "aA=="}},
 ])
 def test_systemone_reject_unsupported_media(part):
     server.start()
     res = server.make_request("POST", "/v1/systemone", data={
+        "model": server.model_alias,
         "state": {"content": [part]},
         "questions": {"q": {"type": "noul", "instructions": "Check"}},
     })
-    assert res.status_code == 400, res.body
+    assert res.status_code == 422, res.body
 
 
-@pytest.mark.parametrize("question_type", ["choice", "score", "noul"])
-def test_systemone_matches_native_probabilities(question_type):
+@pytest.mark.parametrize("question_type,null_descriptions", [("choice", False), ("choice", True), ("score", False), ("noul", False)])
+def test_systemone_matches_native_probabilities(question_type, null_descriptions):
     import math
 
     server.n_ctx = 4096
     server.start()
     descriptions = [{"answer": "yes", "criterion": None}, {"answer": "no", "criterion": None}] if question_type == "noul" else ["Urgent", "Not urgent"]
+    if null_descriptions:
+        descriptions = [None, None]
     payload = {"evidence": "A delayed payment", "criterion": "Is this urgent?", "options": [
         {"letter": chr(65 + i), "description": description} for i, description in enumerate(descriptions)
     ]}
+    if question_type == "choice":
+        for option, name in zip(payload["options"], ["yes", "no"]):
+            option["name"] = name
     messages = [
         {"role": "system", "content": "Apply the supplied criterion to the supplied evidence. Choose exactly one listed option. Respond with only its uppercase letter, with no explanation or reasoning."},
         {"role": "user", "content": json.dumps(payload, separators=(",", ":"))},
@@ -129,10 +137,11 @@ def test_systemone_matches_native_probabilities(question_type):
     expected = [probs[token] / total for token in ids]
     question = {"type": question_type, "instructions": "Is this urgent?"}
     if question_type == "choice":
-        question["criteria"] = {"yes": "Urgent", "no": "Not urgent"}
+        question["criteria"] = dict(zip(["yes", "no"], descriptions))
     elif question_type == "score":
         question["criteria"] = descriptions
     result = server.make_request("POST", "/v1/systemone", data={
+        "model": server.model_alias,
         "state": "A delayed payment", "questions": {"q": question},
     })
     assert result.status_code == 200, result.body
@@ -155,17 +164,21 @@ def test_systemone_validation_and_structured_criteria():
         {"state": "Test", "questions": question, "model": 1},
         {"state": "word " * 10000, "questions": question},
     ]:
+        if isinstance(body, dict):
+            body.setdefault("model", server.model_alias)
         res = server.make_request("POST", "/v1/systemone", data=body)
-        assert res.status_code == 400, res.body
-    empty = server.make_request("POST", "/v1/systemone", data={"state": "Test", "questions": {}})
+        assert res.status_code == 422, res.body
+    empty = server.make_request("POST", "/v1/systemone", data={"model": server.model_alias, "state": "Test", "questions": {}})
     assert empty.status_code == 200, empty.body
     assert empty.body["answers"] == {}
     assert empty.body["usage"] == {"input_tokens": 0, "output_tokens": 0}
     res = server.make_request("POST", "/v1/systemone", data={
+        "model": server.model_alias,
         "state": ["Test"], "questions": {
             "only": {"type": "choice", "instructions": {"task": "Pick"}, "criteria": {"single": None}},
             "score": {"type": "score", "instructions": ["Rate"], "criteria": [{"level": 0}, ["high"]]},
-            "noul": {"type": "noul", "instructions": None, "criteria": {"true": {"rule": "Valid"}}},
+            "noul": {"type": "noul", "instructions": "Is this valid?", "criteria": {"true": {"rule": "Valid"}}},
+            "choice": {"type": "choice", "instructions": ["Choose"], "criteria": {"a": {"rule": "First"}, "b": ["Second"]}},
         },
     })
     assert res.status_code == 200, res.body
@@ -179,6 +192,7 @@ def test_systemone_concurrent_requests():
 
     def evaluate(index):
         return server.make_request("POST", "/v1/systemone", data={
+            "model": server.model_alias,
             "state": "Test", "questions": {
                 str(index): {"type": "choice", "instructions": "Pick", "criteria": {"a": "First", "b": "Second"}},
             },
@@ -190,6 +204,50 @@ def test_systemone_concurrent_requests():
         assert result.status_code == 200, result.body
         assert set(result.body["answers"]) == {str(i)}
         assert result.body["answers"][str(i)]["probabilities"] == pytest.approx(results[0].body["answers"]["0"]["probabilities"], abs=1e-5)
+
+
+def test_systemone_official_validation():
+    server.start()
+    body = {"model": server.model_alias, "state": "Test", "questions": {"urgent": {"type": "noul", "instructions": "Is it urgent?"}}}
+    cases = []
+    for field in ("model", "state", "questions"):
+        missing = dict(body)
+        del missing[field]
+        cases.append((missing, field))
+    for value in (None, 1, ""):
+        cases.append(({**body, "model": value}, "model"))
+    cases.extend([
+        ({**body, "state": None}, "state"),
+        ({**body, "questions": {"urgent": {"type": "noul", "instructions": None}}}, "questions.urgent.instructions"),
+        ({**body, "questions": {"urgent": {"type": "choice", "instructions": "Choose", "criteria": {"a": 3}}}}, "questions.urgent.criteria.a"),
+    ])
+    for request, field in cases:
+        res = server.make_request("POST", "/v1/systemone", data=request)
+        assert res.status_code == 422, res.body
+        assert res.body["error"]["code"] == 422
+        assert field in res.body["error"]["message"]
+    malformed = requests.post(f"http://{server.server_host}:{server.server_port}/v1/systemone", data='{', headers={"Content-Type": "application/json"}, timeout=10)
+    assert malformed.status_code == 422
+    assert malformed.json()["error"]["code"] == 422
+    ordinary = server.make_request("POST", "/completion", data={})
+    assert ordinary.status_code == 400, ordinary.body
+
+
+def test_systemone_structured_state_and_question_ids():
+    server.n_ctx = 4096
+    server.start()
+    question = {"type": "noul", "instructions": "Is `content[1]` a refund request?"}
+    states = [
+        {"content": ["Hello", "Please refund me"]},
+        {"content": [{"type": "order", "id": 1}, {"type": "request", "text": "Please refund me"}]},
+        {"content": [{"type": "text", "text": "Hello"}, {"type": "text", "text": "Please refund me"}]},
+    ]
+    for state in states:
+        res = server.make_request("POST", "/v1/systemone", data={
+            "model": server.model_alias, "state": state, "questions": {"first_id": question, "different_id": question},
+        })
+        assert res.status_code == 200, res.body
+        assert res.body["answers"]["first_id"]["noul"] == pytest.approx(res.body["answers"]["different_id"]["noul"], abs=1e-5)
 
 
 @pytest.mark.parametrize(

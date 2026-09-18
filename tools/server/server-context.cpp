@@ -4282,21 +4282,26 @@ struct systemone_question {
     std::vector<std::string> keys;
     std::vector<json> descriptions;
 
-    static void validate_value(const json & value) {
-        if (!value.is_string() && !value.is_object() && !value.is_array() && !value.is_null()) {
-            throw std::invalid_argument("systemone values must be strings, objects, arrays or null");
+    static void validate_value(const json & value, const std::string & field, bool allow_null = false) {
+        if (!value.is_string() && !value.is_object() && !value.is_array() && !(allow_null && value.is_null())) {
+            throw std::invalid_argument(field + " must be a string, object or array" + (allow_null ? ", or null" : ""));
         }
     }
 
     static std::vector<systemone_question> parse(const json & body) {
-        if (!body.is_object() || !body.contains("state") || !body.contains("questions")) {
-            throw std::invalid_argument("systemone requires state and questions");
+        if (!body.is_object()) {
+            throw std::invalid_argument("systemone request body must be an object");
         }
-        validate_value(body.at("state"));
+        for (const char * field : {"state", "model", "questions"}) {
+            if (!body.contains(field)) {
+                throw std::invalid_argument(std::string(field) + " is required");
+            }
+        }
+        validate_value(body.at("state"), "state");
         if (!body.at("questions").is_object()) {
             throw std::invalid_argument("questions must be an object");
         }
-        if (body.contains("model") && (!body.at("model").is_string() || body.at("model").get<std::string>().empty())) {
+        if (!body.at("model").is_string() || body.at("model").get<std::string>().empty()) {
             throw std::invalid_argument("model must be a non-empty string");
         }
         for (const auto & field : body.items()) {
@@ -4307,28 +4312,29 @@ struct systemone_question {
         std::vector<systemone_question> result;
         for (const auto & item : body.at("questions").items()) {
             const auto & value = item.value();
+            const std::string field = "questions." + item.key();
             if (item.key().empty() || !value.is_object() || !value.contains("type") || !value.at("type").is_string() || !value.contains("instructions")) {
-                throw std::invalid_argument("Each named question requires type and instructions");
+                throw std::invalid_argument(field + " must be a named question with a string type and instructions");
             }
             for (const auto & field : value.items()) {
                 if (field.key() != "type" && field.key() != "instructions" && field.key() != "criteria") {
-                    throw std::invalid_argument("Unknown question field: " + field.key());
+                    throw std::invalid_argument("Unknown field in questions." + item.key() + ": " + field.key());
                 }
             }
             systemone_question question;
             question.name = item.key();
             question.type = value.at("type").get<std::string>();
             question.instructions = value.at("instructions");
-            validate_value(question.instructions);
+            validate_value(question.instructions, field + ".instructions");
             const json criteria = value.value("criteria", json());
             if (question.type == "noul") {
                 if (!criteria.is_null() && !criteria.is_object()) {
-                    throw std::invalid_argument("noul criteria must be an object or null");
+                    throw std::invalid_argument(field + ".criteria must be an object or null for noul");
                 }
                 if (criteria.is_object()) {
                     for (const auto & criterion : criteria.items()) {
                         if (criterion.key() != "true" && criterion.key() != "false") {
-                            throw std::invalid_argument("noul criteria accepts only true and false");
+                            throw std::invalid_argument(field + ".criteria accepts only true and false for noul");
                         }
                     }
                 }
@@ -4339,17 +4345,18 @@ struct systemone_question {
             } else if (question.type == "choice" || question.type == "score") {
                 const bool score = question.type == "score";
                 if ((score && !criteria.is_array()) || (!score && !criteria.is_object()) || criteria.size() < (score ? 2u : 1u) || criteria.size() > 26) {
-                    throw std::invalid_argument("choice criteria must contain 1-26 object entries; score criteria must contain 2-26 array entries");
+                    throw std::invalid_argument(field + ".criteria must contain " + (score ? "2-26 array entries for score" : "1-26 object entries for choice"));
                 }
                 for (const auto & criterion : criteria.items()) {
                     question.keys.push_back(score ? std::to_string(question.keys.size()) : criterion.key());
                     question.descriptions.push_back(criterion.value());
                 }
             } else {
-                throw std::invalid_argument("Question type must be choice, score or noul");
+                throw std::invalid_argument(field + ".type must be choice, score or noul");
             }
-            for (const auto & description : question.descriptions) {
-                validate_value(description);
+            for (size_t i = 0; i < question.descriptions.size(); ++i) {
+                const std::string key = question.type == "noul" ? (i == 0 ? "true" : "false") : question.keys[i];
+                validate_value(question.descriptions[i], field + ".criteria." + key, true);
             }
             result.push_back(std::move(question));
         }
@@ -4359,9 +4366,21 @@ struct systemone_question {
     json messages(const json & state, bool allow_image, bool allow_audio) const {
         json evidence = state;
         json content = json::array();
+        bool has_media = false;
         if (state.is_object() && state.contains("content") && state.at("content").is_array()) {
+            for (const auto & part : state.at("content")) {
+                const std::string type = part.is_object() ? json_value(part, "type", std::string()) : "";
+                has_media |= type == "image_url" || type == "input_audio" || type == "input_video";
+            }
+        }
+        if (has_media) {
             content = state.at("content");
-            evidence.erase("content");
+            // Keep text parts and their paths in evidence; do not send base64 as text.
+            for (auto & part : evidence["content"]) {
+                if (part.is_object() && json_value(part, "type", std::string()) != "text") {
+                    part = {{"type", json_value(part, "type", std::string())}};
+                }
+            }
             for (const auto & part : content) {
                 if (!part.is_object() || !part.contains("type") || !part.at("type").is_string()) {
                     throw std::invalid_argument("state.content requires typed content parts");
@@ -4394,7 +4413,11 @@ struct systemone_question {
             if (type == "noul") {
                 description = {{"answer", keys[i]}, {"criterion", descriptions[i]}};
             }
-            options.push_back({{"letter", std::string(1, char('A' + i))}, {"description", description}});
+            json option = {{"letter", std::string(1, char('A' + i))}, {"description", description}};
+            if (type == "choice") {
+                option["name"] = keys[i];
+            }
+            options.push_back(option);
         }
         const json payload = {{"evidence", evidence}, {"criterion", instructions}, {"options", options}};
         json user_content = payload.dump();
