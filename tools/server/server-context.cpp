@@ -4276,6 +4276,9 @@ void server_context::set_state_callback(server_state_callback_t callback) {
 //
 
 struct systemone_question {
+    static constexpr char alphabet[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+    static constexpr size_t alphabet_size = sizeof(alphabet) - 1;
+
     std::string name;
     std::string type;
     json instructions;
@@ -4366,12 +4369,12 @@ struct systemone_question {
     }
 
     void init_alphabet_sizes() {
-        if (keys.size() <= 26) {
+        if (keys.size() <= alphabet_size) {
             alphabet_sizes = {keys.size()};
             return;
         }
         size_t width = 0;
-        for (size_t remaining = keys.size() - 1; remaining; remaining /= 26) {
+        for (size_t remaining = keys.size() - 1; remaining; remaining /= alphabet_size) {
             ++width;
         }
         std::vector<size_t> current(width);
@@ -4389,7 +4392,7 @@ struct systemone_question {
             }
             size_t needed = (keys.size() - 1) / product + 1;
             for (size_t i = depth; i < width; ++i) {
-                needed = (needed - 1) / 26 + 1;
+                needed = (needed - 1) / alphabet_size + 1;
             }
             if (needed > 1) {
                 return;
@@ -4397,7 +4400,7 @@ struct systemone_question {
             if (depth + 1 == width) {
                 minimum = std::max(minimum, (keys.size() - 1) / product + 1);
             }
-            for (size_t count = minimum; count <= 26; ++count) {
+            for (size_t count = minimum; count <= alphabet_size; ++count) {
                 if (product > best_product / count) {
                     break;
                 }
@@ -4414,7 +4417,7 @@ struct systemone_question {
     std::string label(size_t index) const {
         std::string result;
         for (size_t count : alphabet_sizes) {
-            result += char('A' + index % count);
+            result += alphabet[index % count];
             index /= count;
         }
         return result;
@@ -4485,7 +4488,7 @@ struct systemone_question {
         return json::array({
             {{"role", "system"}, {"content", keys.size() <= 26
                 ? "Apply the supplied criterion to the supplied evidence. Choose exactly one listed option. Respond with only its uppercase letter, with no explanation or reasoning."
-                : "Apply the supplied criterion to the supplied evidence. Choose exactly one listed option. Respond with only its uppercase label, with no explanation or reasoning."}},
+                : "Apply the supplied criterion to the supplied evidence. Choose exactly one listed option. Respond with only its case-sensitive alphanumeric label, with no explanation or reasoning."}},
             {{"role", "user"}, {"content", user_content}},
         });
     }
@@ -5468,7 +5471,7 @@ void server_routes::init_routes() {
             const auto prefix = common_tokenize(ctx_server.vocab, prompt, true, true);
             llama_tokens letters;
             for (size_t i = 0; i < question.alphabet_sizes.back(); ++i) {
-                const std::string label(1, char('A' + i));
+                const std::string label(1, systemone_question::alphabet[i]);
                 const auto extended = common_tokenize(ctx_server.vocab, prompt + label, true, true);
                 if (extended.size() != prefix.size() + 1 || !std::equal(prefix.begin(), prefix.end(), extended.begin()) ||
                     common_token_to_piece(ctx_server.vocab, extended.back()) != label ||

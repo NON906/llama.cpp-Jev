@@ -72,12 +72,15 @@ def test_systemone_26_candidates():
 
 
 @pytest.mark.parametrize("question_type,count,alphabets", [
-    ("choice", 27, [3, 9]),
-    ("score", 29, [2, 15]),
-    ("score", 52, [2, 26]),
-    ("choice", 100, [4, 25]),
-    ("choice", 676, [26, 26]),
-    ("score", 677, [2, 17, 20]),
+    ("choice", 27, [27]),
+    ("score", 52, [52]),
+    ("score", 53, [53]),
+    ("choice", 62, [62]),
+    ("choice", 63, [3, 21]),
+    ("score", 67, [2, 34]),
+    ("choice", 100, [2, 50]),
+    ("choice", 3844, [62, 62]),
+    ("score", 3845, [2, 37, 52]),
 ])
 def test_systemone_multiletter_probabilities(question_type, count, alphabets):
     import math
@@ -85,13 +88,14 @@ def test_systemone_multiletter_probabilities(question_type, count, alphabets):
     server.n_ctx = 4096
     server.n_slots = 1
     server.n_batch = 512
-    if count >= 100:
+    if count >= 53:
         # Keep boundary tests short while retaining the first and last labels.
         server.jinja = True
         server.chat_template = "{% for message in messages %}{% if message.role == 'user' and message.content is string %}{{ message.content[:200] }}{{ message.content[-200:] }}{% endif %}{% endfor %}Answer:"
     server.start()
+    alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
     width = len(alphabets)
-    labels = ["".join(chr(65 + i // math.prod(alphabets[:d]) % alphabets[d]) for d in range(width)) for i in range(count)]
+    labels = ["".join(alphabet[i // math.prod(alphabets[:d]) % alphabets[d]] for d in range(width)) for i in range(count)]
     names = [f"item{i}" for i in range(count)]
     options = [{"letter": label, "description": None} for label in labels]
     if question_type == "choice":
@@ -99,7 +103,7 @@ def test_systemone_multiletter_probabilities(question_type, count, alphabets):
             option["name"] = name
     payload = {"evidence": "Test", "criterion": "Pick", "options": options}
     messages = [
-        {"role": "system", "content": "Apply the supplied criterion to the supplied evidence. Choose exactly one listed option. Respond with only its uppercase label, with no explanation or reasoning."},
+        {"role": "system", "content": "Apply the supplied criterion to the supplied evidence. Choose exactly one listed option. Respond with only its case-sensitive alphanumeric label, with no explanation or reasoning."},
         {"role": "user", "content": json.dumps(payload, separators=(",", ":"))},
     ]
     formatted = server.make_request("POST", "/apply-template", data={"messages": messages, "chat_template_kwargs": {"enable_thinking": False}})
@@ -107,7 +111,7 @@ def test_systemone_multiletter_probabilities(question_type, count, alphabets):
     prompt = formatted.body["prompt"]
     base = server.make_request("POST", "/tokenize", data={"content": prompt, "add_special": True, "parse_special": True}).body["tokens"]
     ids = {}
-    for letter in "ABCDEFGHIJKLMNOPQRSTUVWXYZ":
+    for letter in alphabet[:max(alphabets)]:
         ids[letter] = server.make_request("POST", "/tokenize", data={"content": prompt + letter, "add_special": True, "parse_special": True}).body["tokens"][-1]
     expected = [1.0] * count
     input_tokens = 0
@@ -154,13 +158,15 @@ def test_systemone_prompt_cache(n_slots):
 
     server.n_ctx = 4096
     server.n_slots = n_slots
+    server.jinja = True
+    server.chat_template = "{% for message in messages %}{% if message.role == 'user' and message.content is string %}{{ message.content[:200] }}{{ message.content[-200:] }}{% endif %}{% endfor %}Answer:"
     server.server_metrics = True
     server.start()
     previous = parse_metrics(fetch_metrics(server))
     for state in ("Test", "Different evidence"):
         result = server.make_request("POST", "/v1/systemone", data={
             "model": server.model_alias, "state": state,
-            "questions": {"q": {"type": "score", "instructions": "Pick", "criteria": [None] * 27}},
+            "questions": {"q": {"type": "score", "instructions": "Pick", "criteria": [None] * 63}},
         })
         assert result.status_code == 200, result.body
         assert sum(result.body["answers"]["q"]["probabilities"].values()) == pytest.approx(1)

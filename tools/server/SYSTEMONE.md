@@ -65,19 +65,23 @@ Image URLs, audio data, supported encodings, and `--media-path` follow the exist
 
 The scorer ports OpenJev's direct next-token readout. Each question gets one prompt containing evidence, instructions, and letter-labelled options. It applies the loaded model's chat template with thinking disabled, evaluates the prompt, and reads the final position's native logits. It does not generate an answer, use a grammar, or sample tokens. Sampling options such as temperature, top-k, penalties, and logit bias are not applied.
 
-Options use fixed-width uppercase labels: `A` through `Z` for up to 26 options, two characters for 27-676 options, and the minimum sufficient width for larger sets. Each position uses an alphabet starting at `A` with at most 26 letters. Choose alphabet sizes whose product is the smallest value that can cover all candidates. Among equal products, minimize prefix readouts by placing smaller alphabets first. The first character still changes fastest: 27 options use `AA`, `BA`, `CA`, `AB`, `BB`, `CB`, ..., `CI` (3 x 9), and 52 options use `AA`, `BA`, `AB`, `BB`, ..., `AZ`, `BZ` (2 x 26). Changing the label mapping changes the prompt and can change the returned probabilities. Each uppercase character must add exactly one distinct token to the actual prompt, without changing its prefix tokenization. Later characters are evaluated by appending these character token IDs individually, even if tokenizing the complete label would merge them. An incompatible model/template produces HTTP 422 naming the label. Characters requiring multiple tokens and truncated prompts are not approximated. Choice names and descriptions both enter the prompt; question IDs do not. Choice keys and score items retain request order. Ties select the first mapped option.
+Options use fixed-width, case-sensitive labels from `ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789`, in that order. Up to 62 options use one character (`A`-`Z`, then `a`-`z`, then `0`-`9`); 63-3844 options use two characters, and larger sets use the minimum sufficient width. Each position uses a prefix of this 62-character alphabet. Choose alphabet sizes whose product is the smallest value that can cover all candidates. Among equal products, minimize prefix readouts by placing smaller alphabets first. The first character changes fastest: 63 options use `AA`, `BA`, `CA`, `AB`, `BB`, `CB`, ..., `CU` (3 x 21). Changing the label mapping changes the prompt and can change the returned probabilities. Each used character must add exactly one distinct token to the actual prompt, without changing its prefix tokenization. Later characters are evaluated by appending these character token IDs individually, even if tokenizing the complete label would merge them. An incompatible model/template produces HTTP 422 naming the label. Characters requiring multiple tokens and truncated prompts are not approximated. Choice names and descriptions both enter the prompt; question IDs do not. Choice keys and score items retain request order. Ties select the first mapped option.
 
-For each label position, normalize over the characters used at that position across all labels, regardless of the preceding characters. Evaluate logits after feeding the preceding character tokens into the model. For 29 options, every second-position readout uses `A` through `O` after either `A` or `B`, even though the final combination `BO` is not a listed option.
+For each label position, normalize over the characters used at that position across all labels, regardless of the preceding characters. Evaluate logits after feeding the preceding character tokens into the model. For 67 options, every second-position readout uses `A`-`Z` and `a`-`h` after either `A` or `B`, even though the final combination `Bh` is not a listed option.
 
 With alphabet sizes `r[0]`, `r[1]`, ..., the number of readouts is `1 + r[0] + r[0]*r[1] + ...` (excluding the full-label product). For example:
 
 | Candidates | Alphabet sizes | Label combinations | Readouts |
 | --- | --- | --- | --- |
-| 27 | 3 x 9 | 27 | 4 |
-| 29 | 2 x 15 | 30 | 3 |
-| 52 | 2 x 26 | 52 | 3 |
-| 100 | 4 x 25 | 100 | 5 |
-| 677 | 2 x 17 x 20 | 680 | 37 |
+| 27 | 27 | 27 | 1 |
+| 53 | 53 | 53 | 1 |
+| 62 | 62 | 62 | 1 |
+| 63 | 3 x 21 | 63 | 4 |
+| 67 | 2 x 34 | 68 | 3 |
+| 100 | 2 x 50 | 100 | 3 |
+| 677 | 17 x 40 | 680 | 18 |
+| 3844 | 62 x 62 | 3844 | 63 |
+| 3845 | 2 x 37 x 52 | 3848 | 77 |
 
 Calculate each conditional probability and the label probability in double precision:
 
@@ -89,7 +93,7 @@ best = argmax(p)
 confidence = p[best] * product_{i != best}(1 - p[i])
 ```
 
-Unlisted combinations participate in the per-position normalization. After multiplying the conditional probabilities, renormalize over the listed candidates so returned probabilities sum to 1, including with 29 or 677 options. Confidence and score use these renormalized probabilities. With 52 options, `weight(BA) = p(B) * p(A | B)`, with the first readout normalized over `A`-`B` and the second over `A`-`Z`.
+Unlisted combinations participate in the per-position normalization. After multiplying the conditional probabilities, renormalize over the listed candidates so returned probabilities sum to 1, including with 67 or 3845 options. Confidence and score use these renormalized probabilities. With 100 options, `weight(BA) = p(B) * p(A | B)`, with the first readout normalized over `A`-`B` and the second over `A`-`Z` and `a`-`x`.
 
 - `choice`: returns `type`, the original key in `choice`, `probabilities` keyed by the original choices, and `confidence`.
 - `score`: numbers the items `0`, `1`, ..., and returns `score = sum(i * p[i])`, `confidence`, `probabilities`, and `legend`. Legend values are strings; structured descriptions are serialized as JSON.
@@ -105,7 +109,7 @@ The official references have some differences. The API table lists string/null c
 
 Intentional differences from the hosted service:
 
-- Choice and score have no fixed candidate-count limit and use uppercase character sequences. The official guides describe up to 255 choices and 10 score levels.
+- Choice and score have no fixed candidate-count limit and use case-sensitive alphanumeric character sequences. The official guides describe up to 255 choices and 10 score levels.
 - The [official state guide](https://docs.typesafe.ai/concepts/state) describes text input. Image/audio state is a local extension.
 - Probabilities and confidence use the requested OpenJev readout and formulas above. They do not reproduce Jev's trained calibration.
 - Token usage reflects local per-question prompts and zero generated tokens.
@@ -115,13 +119,13 @@ Intentional differences from the hosted service:
 
 The HTTP layer validates JSON, formats prompts with the existing chat/media parser, validates answer boundaries, and assembles answers. `SERVER_TASK_TYPE_SYSTEMONE` uses the existing queue, cancellation, slots, and batching. At prompt completion the inference thread copies only the requested logits, returns them, and releases the slot. Softmax and response formatting run in the HTTP thread. The first readout of each question evaluates the prompt without reusing a cache. Subsequent label-prefix readouts reuse the longest common prefix in their assigned slot through the existing prompt KV cache. Only the suffix is evaluated when the model supports reuse and the cached prefix remains available. Multiple slots can each require an initial prefill; cache eviction or models with restricted state rollback can require reevaluation.
 
-Regression coverage lives in `tests/unit/test_chat_completion.py` under `test_systemone_*`, using the existing server test infrastructure. It checks all answer types and arithmetic, string/object states, 26/27/29/52/100/676/677 candidates, conditional multi-character probabilities including unlisted combinations, measured KV reuse with one and two slots, invalid inputs, unsupported media, repeat requests, subsequent ordinary completion, and agreement with native full-vocabulary probabilities.
+Regression coverage lives in `tests/unit/test_chat_completion.py` under `test_systemone_*`, using the existing server test infrastructure. It checks all answer types and arithmetic, string/object states, 26/27/52/53/62/63/67/100/3844/3845 candidates, conditional multi-character probabilities including unlisted combinations, measured KV reuse with one and two slots, invalid inputs, unsupported media, repeat requests, subsequent ordinary completion, and agreement with native full-vocabulary probabilities.
 
 Manual acceptance checklist for deployment models:
 
 - Run the example with the intended GGUF and verify all fields and usage.
 - Evaluate known labelled cases; measure decision quality separately from API correctness. These probabilities are conditional option scores, not calibrated Jev confidence.
-- Submit 26, 27, 29, 52, 100, 676, and 677 candidates and confirm label widths, ordering, and conditional probabilities. Increase `--ctx-size` as needed.
+- Submit 26, 27, 52, 53, 62, 63, 67, 100, 3844, and 3845 candidates and confirm label widths, ordering, and conditional probabilities. Increase `--ctx-size` as needed.
 - Confirm partial final groups use the same per-position alphabet for every prefix, then renormalize the returned candidate probabilities to sum to 1.
 - Measure latency and memory with realistic candidate counts: every distinct label prefix requires a readout, but subsequent readouts reuse the common prompt KV cache within each slot. Check `llamacpp:prompt_tokens_total` and `llamacpp:prompt_tokens_cached_total` with `--metrics`.
 - With a vision model/projector, compare real image inputs and verify image changes affect the scores.
