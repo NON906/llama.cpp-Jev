@@ -762,7 +762,7 @@ This endpoint also supports multimodal embeddings. See the documentation for the
 
 ### POST `/v1/systemone`: Evaluate typed questions
 
-Evaluates `choice`, `score`, and `noul` questions using native next-token logits restricted to uppercase answer labels (`A`-`Z`, at most 26 candidates). Accepts string or structured `state`, including image/audio content with a compatible model and projector. No answer tokens are generated. See [System One API](SYSTEMONE.md) for the request format, formulas, examples, and limitations.
+Evaluates `choice`, `score`, and `noul` questions using native next-token logits restricted to uppercase answer labels (`A`-`Z`, extended to multiple characters as needed, with no fixed candidate-count limit). Accepts string or structured `state`, including image/audio content with a compatible model and projector. No answer tokens are generated. See [System One API](SYSTEMONE.md) for the request format, formulas, examples, and limitations.
 
 ### POST `/reranking`: Rerank documents according to a given query
 

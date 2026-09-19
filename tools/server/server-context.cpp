@@ -4344,8 +4344,8 @@ struct systemone_question {
                 }
             } else if (question.type == "choice" || question.type == "score") {
                 const bool score = question.type == "score";
-                if ((score && !criteria.is_array()) || (!score && !criteria.is_object()) || criteria.size() < (score ? 2u : 1u) || criteria.size() > 26) {
-                    throw std::invalid_argument(field + ".criteria must contain " + (score ? "2-26 array entries for score" : "1-26 object entries for choice"));
+                if ((score && !criteria.is_array()) || (!score && !criteria.is_object()) || criteria.size() < (score ? 2u : 1u)) {
+                    throw std::invalid_argument(field + ".criteria must contain " + (score ? "at least 2 array entries for score" : "at least 1 object entry for choice"));
                 }
                 for (const auto & criterion : criteria.items()) {
                     question.keys.push_back(score ? std::to_string(question.keys.size()) : criterion.key());
@@ -4360,6 +4360,17 @@ struct systemone_question {
             }
             result.push_back(std::move(question));
         }
+        return result;
+    }
+
+    std::string label(size_t index) const {
+        std::string result;
+        size_t remaining = keys.size() - 1;
+        do {
+            result += char('A' + index % 26);
+            index /= 26;
+            remaining /= 26;
+        } while (remaining);
         return result;
     }
 
@@ -4413,7 +4424,7 @@ struct systemone_question {
             if (type == "noul") {
                 description = {{"answer", keys[i]}, {"criterion", descriptions[i]}};
             }
-            json option = {{"letter", std::string(1, char('A' + i))}, {"description", description}};
+            json option = {{"letter", label(i)}, {"description", description}};
             if (type == "choice") {
                 option["name"] = keys[i];
             }
@@ -4426,13 +4437,15 @@ struct systemone_question {
             user_content = std::move(content);
         }
         return json::array({
-            {{"role", "system"}, {"content", "Apply the supplied criterion to the supplied evidence. Choose exactly one listed option. Respond with only its uppercase letter, with no explanation or reasoning."}},
+            {{"role", "system"}, {"content", keys.size() <= 26
+                ? "Apply the supplied criterion to the supplied evidence. Choose exactly one listed option. Respond with only its uppercase letter, with no explanation or reasoning."
+                : "Apply the supplied criterion to the supplied evidence. Choose exactly one listed option. Respond with only its uppercase label, with no explanation or reasoning."}},
             {{"role", "user"}, {"content", user_content}},
         });
     }
 
-    json answer(const std::vector<float> & logits) const {
-        if (logits.size() != keys.size()) {
+    static std::vector<double> probabilities(const std::vector<float> & logits) {
+        if (logits.empty()) {
             throw std::runtime_error("Invalid systemone logit count");
         }
         const size_t best = std::max_element(logits.begin(), logits.end()) - logits.begin();
@@ -4449,6 +4462,21 @@ struct systemone_question {
         for (double & probability : probabilities) {
             probability /= total;
         }
+        return probabilities;
+    }
+
+    json answer(std::vector<double> probabilities) const {
+        double total = 0.0;
+        for (double probability : probabilities) {
+            total += probability;
+        }
+        if (!std::isfinite(total) || total <= 0.0) {
+            throw std::runtime_error("Invalid systemone probability total");
+        }
+        for (double & probability : probabilities) {
+            probability /= total;
+        }
+        const size_t best = std::max_element(probabilities.begin(), probabilities.end()) - probabilities.begin();
         if (type == "noul") {
             return {{"type", type}, {"noul", (probabilities[0] + 1.0 - probabilities[1]) * 0.5}};
         }
@@ -5375,7 +5403,15 @@ void server_routes::init_routes() {
         const auto questions = systemone_question::parse(body);
         auto & rd = res->rd;
         std::vector<server_task> tasks;
+        struct readout {
+            size_t question;
+            size_t offset;
+            size_t stride;
+        };
+        std::vector<readout> readouts;
+        std::vector<std::vector<double>> probabilities;
         for (const auto & question : questions) {
+            probabilities.emplace_back(question.keys.size(), 1.0);
             json chat = {
                 {"messages", question.messages(body.at("state"), meta->has_inp_image, meta->has_inp_audio)},
                 {"chat_template_kwargs", {{"enable_thinking", false}}},
@@ -5384,28 +5420,48 @@ void server_routes::init_routes() {
             const json parsed = oaicompat_chat_params_parse(chat, meta->chat_params, files);
             const std::string prompt = parsed.at("prompt");
             const auto prefix = common_tokenize(ctx_server.vocab, prompt, true, true);
-            server_task task(SERVER_TASK_TYPE_SYSTEMONE);
-            task.id = rd.get_new_id();
-            task.params.cache_prompt = false;
-            for (size_t i = 0; i < question.keys.size(); ++i) {
+            llama_tokens letters;
+            for (size_t i = 0; i < std::min(size_t(26), question.keys.size()); ++i) {
                 const std::string label(1, char('A' + i));
                 const auto extended = common_tokenize(ctx_server.vocab, prompt + label, true, true);
                 if (extended.size() != prefix.size() + 1 || !std::equal(prefix.begin(), prefix.end(), extended.begin()) ||
                     common_token_to_piece(ctx_server.vocab, extended.back()) != label ||
-                    std::find(task.systemone_tokens.begin(), task.systemone_tokens.end(), extended.back()) != task.systemone_tokens.end()) {
+                    std::find(letters.begin(), letters.end(), extended.back()) != letters.end()) {
                     throw std::invalid_argument("Answer label " + label + " is not a distinct single token at the answer boundary for this model and chat template");
                 }
-                task.systemone_tokens.push_back(extended.back());
+                letters.push_back(extended.back());
             }
+            server_tokens tokens;
             if (ctx_server.mctx) {
-                task.tokens = process_mtmd_prompt(ctx_server.mctx, prompt, files, ctx_server.init_opt);
+                tokens = process_mtmd_prompt(ctx_server.mctx, prompt, files, ctx_server.init_opt);
             } else {
-                task.tokens = std::move(tokenize_input_prompts(ctx_server.vocab, nullptr, prompt, true, true, ctx_server.init_opt)[0]);
+                tokens = std::move(tokenize_input_prompts(ctx_server.vocab, nullptr, prompt, true, true, ctx_server.init_opt)[0]);
             }
-            if (task.tokens.empty() || task.n_tokens() >= meta->slot_n_ctx) {
+            const size_t width = question.label(0).size();
+            if (tokens.empty() || tokens.size() + width - 1 >= size_t(meta->slot_n_ctx)) {
                 throw std::invalid_argument("systemone prompt is empty or exceeds the slot context; increase --ctx-size");
             }
-            tasks.push_back(std::move(task));
+            size_t stride = 1;
+            for (size_t depth = 0; depth < width; ++depth) {
+                const size_t count = std::min(size_t(26), (question.keys.size() - 1) / stride + 1);
+                for (size_t offset = 0; offset < stride && offset < question.keys.size(); ++offset) {
+                    server_task task(SERVER_TASK_TYPE_SYSTEMONE);
+                    task.id = rd.get_new_id();
+                    task.params.cache_prompt = false;
+                    task.tokens = tokens.clone();
+                    size_t index = offset;
+                    for (size_t i = 0; i < depth; ++i) {
+                        task.tokens.push_back(letters[index % 26]);
+                        index /= 26;
+                    }
+                    task.systemone_tokens.assign(letters.begin(), letters.begin() + count);
+                    readouts.push_back({probabilities.size() - 1, offset, stride});
+                    tasks.push_back(std::move(task));
+                }
+                if (depth + 1 < width) {
+                    stride *= 26;
+                }
+            }
         }
         rd.post_tasks(std::move(tasks));
         auto results = rd.wait_for_all(req.should_stop);
@@ -5421,8 +5477,16 @@ void server_routes::init_routes() {
         for (const auto & result : results.results) {
             const auto * scored = dynamic_cast<const server_task_result_systemone *>(result.get());
             GGML_ASSERT(scored != nullptr);
-            answers[questions[scored->index].name] = questions[scored->index].answer(scored->logits);
+            const auto & readout = readouts[scored->index];
+            const auto conditional = systemone_question::probabilities(scored->logits);
+            auto & joint = probabilities[readout.question];
+            for (size_t i = readout.offset; i < joint.size(); i += readout.stride) {
+                joint[i] *= conditional[(i / readout.stride) % 26];
+            }
             input_tokens += scored->n_tokens;
+        }
+        for (size_t i = 0; i < questions.size(); ++i) {
+            answers[questions[i].name] = questions[i].answer(probabilities[i]);
         }
         res->ok({{"model", meta->model_name}, {"answers", answers}, {"usage", {{"input_tokens", input_tokens}, {"output_tokens", 0}}}});
         return res;

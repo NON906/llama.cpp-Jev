@@ -71,9 +71,75 @@ def test_systemone_26_candidates():
     assert answer["legend"]["25"] == "Level 25"
 
 
+@pytest.mark.parametrize("question_type,count", [("choice", 27), ("score", 52), ("choice", 676), ("score", 677)])
+def test_systemone_multiletter_probabilities(question_type, count):
+    import math
+
+    server.n_ctx = 4096
+    server.n_slots = 1
+    server.n_batch = 512
+    if count >= 676:
+        # Keep boundary tests short while retaining the first and last labels.
+        server.jinja = True
+        server.chat_template = "{% for message in messages %}{% if message.role == 'user' and message.content is string %}{{ message.content[:200] }}{{ message.content[-200:] }}{% endif %}{% endfor %}Answer:"
+    server.start()
+    width = 2 if count <= 676 else 3
+    labels = ["".join(chr(65 + i // (26 ** d) % 26) for d in range(width)) for i in range(count)]
+    names = [f"item{i}" for i in range(count)]
+    options = [{"letter": label, "description": None} for label in labels]
+    if question_type == "choice":
+        for option, name in zip(options, names):
+            option["name"] = name
+    payload = {"evidence": "Test", "criterion": "Pick", "options": options}
+    messages = [
+        {"role": "system", "content": "Apply the supplied criterion to the supplied evidence. Choose exactly one listed option. Respond with only its uppercase label, with no explanation or reasoning."},
+        {"role": "user", "content": json.dumps(payload, separators=(",", ":"))},
+    ]
+    formatted = server.make_request("POST", "/apply-template", data={"messages": messages, "chat_template_kwargs": {"enable_thinking": False}})
+    assert formatted.status_code == 200, formatted.body
+    prompt = formatted.body["prompt"]
+    base = server.make_request("POST", "/tokenize", data={"content": prompt, "add_special": True, "parse_special": True}).body["tokens"]
+    ids = {}
+    for letter in "ABCDEFGHIJKLMNOPQRSTUVWXYZ":
+        ids[letter] = server.make_request("POST", "/tokenize", data={"content": prompt + letter, "add_special": True, "parse_special": True}).body["tokens"][-1]
+    expected = [1.0] * count
+    for depth in range(width):
+        children = list(dict.fromkeys(label[depth] for label in labels))
+        for prefix in dict.fromkeys(label[:depth] for label in labels):
+            reference = server.make_request("POST", "/completion", data={
+                "prompt": base + [ids[letter] for letter in prefix], "n_predict": 1, "cache_prompt": False,
+                "n_probs": 100000, "temperature": 1.0, "post_sampling_probs": False,
+            })
+            assert reference.status_code == 200, reference.body
+            probs = {p["id"]: math.exp(p["logprob"]) for p in reference.body["completion_probabilities"][0]["top_logprobs"]}
+            total = sum(probs[ids[letter]] for letter in children)
+            for i, label in enumerate(labels):
+                if label.startswith(prefix):
+                    expected[i] *= probs[ids[label[depth]]] / total
+    total = sum(expected)
+    if count in (27, 677):
+        assert 0 < total < 1
+    expected = [p / total for p in expected]
+    criteria = dict.fromkeys(names) if question_type == "choice" else [None] * count
+    result = server.make_request("POST", "/v1/systemone", data={
+        "model": server.model_alias, "state": "Test",
+        "questions": {"q": {"type": question_type, "instructions": "Pick", "criteria": criteria}},
+    })
+    assert result.status_code == 200, result.body
+    answer = result.body["answers"]["q"]
+    keys = names if question_type == "choice" else [str(i) for i in range(count)]
+    assert [answer["probabilities"][key] for key in keys] == pytest.approx(expected, rel=1e-3, abs=1e-6)
+    assert sum(answer["probabilities"].values()) == pytest.approx(1)
+    best = max(range(count), key=expected.__getitem__)
+    assert answer["confidence"] == pytest.approx(expected[best] * math.prod(1 - p for i, p in enumerate(expected) if i != best), rel=1e-3, abs=1e-6)
+    if question_type == "choice":
+        assert answer["choice"] == names[best]
+    else:
+        assert answer["score"] == pytest.approx(sum(i * p for i, p in enumerate(expected)), rel=1e-3)
+
+
 @pytest.mark.parametrize("question", [
     {"type": "choice", "instructions": "Pick", "criteria": {}},
-    {"type": "choice", "instructions": "Pick", "criteria": {str(i): "x" for i in range(27)}},
     {"type": "score", "instructions": "Rate", "criteria": ["Only"]},
     {"type": "score", "instructions": "Rate", "criteria": {"0": "Low", "1": "High"}},
     {"type": "noul", "instructions": "Check", "criteria": {"yes": "Wrong key"}},
