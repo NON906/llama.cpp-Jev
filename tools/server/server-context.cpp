@@ -5447,7 +5447,7 @@ void server_routes::init_routes() {
                 for (size_t offset = 0; offset < stride && offset < question.keys.size(); ++offset) {
                     server_task task(SERVER_TASK_TYPE_SYSTEMONE);
                     task.id = rd.get_new_id();
-                    task.params.cache_prompt = false;
+                    task.params.cache_prompt = depth > 0;
                     task.tokens = tokens.clone();
                     size_t index = offset;
                     for (size_t i = 0; i < depth; ++i) {

@@ -85,7 +85,7 @@ Unlisted combinations participate in the per-position normalization. After multi
 - `score`: numbers the items `0`, `1`, ..., and returns `score = sum(i * p[i])`, `confidence`, `probabilities`, and `legend`. Legend values are strings; structured descriptions are serialized as JSON.
 - `noul`: maps `yes` and `no` to the two letter slots and returns only `type` and `noul = (p[yes] + 1 - p[no]) * 0.5`. This equals `p[yes]` because these two probabilities sum to 1.
 
-The response has `model`, `answers`, and `usage`. `usage.input_tokens` sums all evaluated prompts, including media tokens and supplied label prefixes; repeated evidence is counted for every prefix readout. `usage.output_tokens` is zero because no tokens are generated. Question and prefix readouts are queued independently and can share server batches when slots are available; this is not a single joint forward pass for all questions. There is no streaming response.
+The response has `model`, `answers`, and `usage`. `usage.input_tokens` sums all evaluated prompts, including media tokens and supplied label prefixes; repeated evidence is counted for every prefix readout, including tokens reused from the KV cache. This logical usage is not the number of tokens actually reevaluated. `usage.output_tokens` is zero because no tokens are generated. Question and prefix readouts are queued independently and can share server batches when slots are available; this is not a single joint forward pass for all questions. There is no streaming response.
 
 ## Compatibility notes
 
@@ -103,9 +103,9 @@ Intentional differences from the hosted service:
 
 ## Design and verification
 
-The HTTP layer validates JSON, formats prompts with the existing chat/media parser, validates answer boundaries, and assembles answers. `SERVER_TASK_TYPE_SYSTEMONE` uses the existing queue, cancellation, slots, and batching. At prompt completion the inference thread copies only the requested logits, returns them, and releases the slot. Softmax and response formatting run in the HTTP thread. Prompt caching is disabled for these tasks.
+The HTTP layer validates JSON, formats prompts with the existing chat/media parser, validates answer boundaries, and assembles answers. `SERVER_TASK_TYPE_SYSTEMONE` uses the existing queue, cancellation, slots, and batching. At prompt completion the inference thread copies only the requested logits, returns them, and releases the slot. Softmax and response formatting run in the HTTP thread. The first readout of each question evaluates the prompt without reusing a cache. Subsequent label-prefix readouts reuse the longest common prefix in their assigned slot through the existing prompt KV cache. Only the suffix is evaluated when the model supports reuse and the cached prefix remains available. Multiple slots can each require an initial prefill; cache eviction or models with restricted state rollback can require reevaluation.
 
-Regression coverage lives in `tests/unit/test_chat_completion.py` under `test_systemone_*`, using the existing server test infrastructure. It checks all answer types and arithmetic, string/object states, 26/27/52/676/677 candidates, conditional multi-character probabilities including unlisted combinations, invalid inputs, unsupported media, repeat requests, subsequent ordinary completion, and agreement with native full-vocabulary probabilities.
+Regression coverage lives in `tests/unit/test_chat_completion.py` under `test_systemone_*`, using the existing server test infrastructure. It checks all answer types and arithmetic, string/object states, 26/27/52/676/677 candidates, conditional multi-character probabilities including unlisted combinations, measured KV reuse with one and two slots, invalid inputs, unsupported media, repeat requests, subsequent ordinary completion, and agreement with native full-vocabulary probabilities.
 
 Manual acceptance checklist for deployment models:
 
@@ -113,7 +113,7 @@ Manual acceptance checklist for deployment models:
 - Evaluate known labelled cases; measure decision quality separately from API correctness. These probabilities are conditional option scores, not calibrated Jev confidence.
 - Submit 26, 27, 52, 676, and 677 candidates and confirm label widths, ordering, and conditional probabilities. Increase `--ctx-size` as needed.
 - Confirm partial final groups use the same per-position alphabet for every prefix, then renormalize the returned candidate probabilities to sum to 1.
-- Measure latency and memory with realistic candidate counts: every distinct label prefix requires a separate prompt evaluation, with prompt caching disabled.
+- Measure latency and memory with realistic candidate counts: every distinct label prefix requires a readout, but subsequent readouts reuse the common prompt KV cache within each slot. Check `llamacpp:prompt_tokens_total` and `llamacpp:prompt_tokens_cached_total` with `--metrics`.
 - With a vision model/projector, compare real image inputs and verify image changes affect the scores.
 - With an audio model/projector, submit real WAV input and verify audio changes affect the scores.
 - For mixed input, use a model that supports both image and audio.

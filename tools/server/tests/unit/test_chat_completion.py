@@ -107,7 +107,7 @@ def test_systemone_multiletter_probabilities(question_type, count):
         children = list(dict.fromkeys(label[depth] for label in labels))
         for prefix in dict.fromkeys(label[:depth] for label in labels):
             reference = server.make_request("POST", "/completion", data={
-                "prompt": base + [ids[letter] for letter in prefix], "n_predict": 1, "cache_prompt": False,
+                "prompt": base + [ids[letter] for letter in prefix], "n_predict": 1, "cache_prompt": depth > 0,
                 "n_probs": 100000, "temperature": 1.0, "post_sampling_probs": False,
             })
             assert reference.status_code == 200, reference.body
@@ -136,6 +136,32 @@ def test_systemone_multiletter_probabilities(question_type, count):
         assert answer["choice"] == names[best]
     else:
         assert answer["score"] == pytest.approx(sum(i * p for i, p in enumerate(expected)), rel=1e-3)
+
+
+@pytest.mark.parametrize("n_slots", [1, 2])
+def test_systemone_prompt_cache(n_slots):
+    from test_metrics import fetch_metrics, parse_metrics
+
+    server.n_ctx = 4096
+    server.n_slots = n_slots
+    server.server_metrics = True
+    server.start()
+    previous = parse_metrics(fetch_metrics(server))
+    for state in ("Test", "Different evidence"):
+        result = server.make_request("POST", "/v1/systemone", data={
+            "model": server.model_alias, "state": state,
+            "questions": {"q": {"type": "score", "instructions": "Pick", "criteria": [None] * 27}},
+        })
+        assert result.status_code == 200, result.body
+        assert sum(result.body["answers"]["q"]["probabilities"].values()) == pytest.approx(1)
+        current = parse_metrics(fetch_metrics(server))
+        processed = current["llamacpp:prompt_tokens_total"][1] - previous["llamacpp:prompt_tokens_total"][1]
+        cached = current["llamacpp:prompt_tokens_cached_total"][1] - previous["llamacpp:prompt_tokens_cached_total"][1]
+        logical = result.body["usage"]["input_tokens"]
+        assert processed + cached == logical
+        assert cached > 0.8 * logical
+        assert processed < 0.2 * logical
+        previous = current
 
 
 @pytest.mark.parametrize("question", [
