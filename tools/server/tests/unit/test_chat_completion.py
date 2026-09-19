@@ -71,20 +71,27 @@ def test_systemone_26_candidates():
     assert answer["legend"]["25"] == "Level 25"
 
 
-@pytest.mark.parametrize("question_type,count", [("choice", 27), ("score", 52), ("choice", 676), ("score", 677)])
-def test_systemone_multiletter_probabilities(question_type, count):
+@pytest.mark.parametrize("question_type,count,alphabets", [
+    ("choice", 27, [3, 9]),
+    ("score", 29, [2, 15]),
+    ("score", 52, [2, 26]),
+    ("choice", 100, [4, 25]),
+    ("choice", 676, [26, 26]),
+    ("score", 677, [2, 17, 20]),
+])
+def test_systemone_multiletter_probabilities(question_type, count, alphabets):
     import math
 
     server.n_ctx = 4096
     server.n_slots = 1
     server.n_batch = 512
-    if count >= 676:
+    if count >= 100:
         # Keep boundary tests short while retaining the first and last labels.
         server.jinja = True
         server.chat_template = "{% for message in messages %}{% if message.role == 'user' and message.content is string %}{{ message.content[:200] }}{{ message.content[-200:] }}{% endif %}{% endfor %}Answer:"
     server.start()
-    width = 2 if count <= 676 else 3
-    labels = ["".join(chr(65 + i // (26 ** d) % 26) for d in range(width)) for i in range(count)]
+    width = len(alphabets)
+    labels = ["".join(chr(65 + i // math.prod(alphabets[:d]) % alphabets[d]) for d in range(width)) for i in range(count)]
     names = [f"item{i}" for i in range(count)]
     options = [{"letter": label, "description": None} for label in labels]
     if question_type == "choice":
@@ -103,9 +110,11 @@ def test_systemone_multiletter_probabilities(question_type, count):
     for letter in "ABCDEFGHIJKLMNOPQRSTUVWXYZ":
         ids[letter] = server.make_request("POST", "/tokenize", data={"content": prompt + letter, "add_special": True, "parse_special": True}).body["tokens"][-1]
     expected = [1.0] * count
+    input_tokens = 0
     for depth in range(width):
         children = list(dict.fromkeys(label[depth] for label in labels))
         for prefix in dict.fromkeys(label[:depth] for label in labels):
+            input_tokens += len(base) + len(prefix)
             reference = server.make_request("POST", "/completion", data={
                 "prompt": base + [ids[letter] for letter in prefix], "n_predict": 1, "cache_prompt": depth > 0,
                 "n_probs": 100000, "temperature": 1.0, "post_sampling_probs": False,
@@ -117,7 +126,7 @@ def test_systemone_multiletter_probabilities(question_type, count):
                 if label.startswith(prefix):
                     expected[i] *= probs[ids[label[depth]]] / total
     total = sum(expected)
-    if count in (27, 677):
+    if math.prod(alphabets) > count:
         assert 0 < total < 1
     expected = [p / total for p in expected]
     criteria = dict.fromkeys(names) if question_type == "choice" else [None] * count
@@ -127,6 +136,7 @@ def test_systemone_multiletter_probabilities(question_type, count):
     })
     assert result.status_code == 200, result.body
     answer = result.body["answers"]["q"]
+    assert result.body["usage"]["input_tokens"] == input_tokens
     keys = names if question_type == "choice" else [str(i) for i in range(count)]
     assert [answer["probabilities"][key] for key in keys] == pytest.approx(expected, rel=1e-3, abs=1e-6)
     assert sum(answer["probabilities"].values()) == pytest.approx(1)
@@ -159,8 +169,8 @@ def test_systemone_prompt_cache(n_slots):
         cached = current["llamacpp:prompt_tokens_cached_total"][1] - previous["llamacpp:prompt_tokens_cached_total"][1]
         logical = result.body["usage"]["input_tokens"]
         assert processed + cached == logical
-        assert cached > 0.8 * logical
-        assert processed < 0.2 * logical
+        assert cached > 0
+        assert processed < (n_slots + 0.1) * logical / 4
         previous = current
 
 

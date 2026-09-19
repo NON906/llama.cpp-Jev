@@ -4281,6 +4281,7 @@ struct systemone_question {
     json instructions;
     std::vector<std::string> keys;
     std::vector<json> descriptions;
+    std::vector<size_t> alphabet_sizes;
 
     static void validate_value(const json & value, const std::string & field, bool allow_null = false) {
         if (!value.is_string() && !value.is_object() && !value.is_array() && !(allow_null && value.is_null())) {
@@ -4358,19 +4359,64 @@ struct systemone_question {
                 const std::string key = question.type == "noul" ? (i == 0 ? "true" : "false") : question.keys[i];
                 validate_value(question.descriptions[i], field + ".criteria." + key, true);
             }
+            question.init_alphabet_sizes();
             result.push_back(std::move(question));
         }
         return result;
     }
 
+    void init_alphabet_sizes() {
+        if (keys.size() <= 26) {
+            alphabet_sizes = {keys.size()};
+            return;
+        }
+        size_t width = 0;
+        for (size_t remaining = keys.size() - 1; remaining; remaining /= 26) {
+            ++width;
+        }
+        std::vector<size_t> current(width);
+        size_t best_product = SIZE_MAX;
+        size_t best_readouts = SIZE_MAX;
+        // Sorted alphabets minimize prefix readouts for the same product.
+        std::function<void(size_t, size_t, size_t, size_t)> search = [&](size_t depth, size_t minimum, size_t product, size_t readouts) {
+            if (depth == width) {
+                if (product >= keys.size() && (product < best_product || (product == best_product && readouts < best_readouts))) {
+                    alphabet_sizes = current;
+                    best_product = product;
+                    best_readouts = readouts;
+                }
+                return;
+            }
+            size_t needed = (keys.size() - 1) / product + 1;
+            for (size_t i = depth; i < width; ++i) {
+                needed = (needed - 1) / 26 + 1;
+            }
+            if (needed > 1) {
+                return;
+            }
+            if (depth + 1 == width) {
+                minimum = std::max(minimum, (keys.size() - 1) / product + 1);
+            }
+            for (size_t count = minimum; count <= 26; ++count) {
+                if (product > best_product / count) {
+                    break;
+                }
+                current[depth] = count;
+                search(depth + 1, count, product * count, readouts + product);
+            }
+        };
+        search(0, 2, 1, 0);
+        if (alphabet_sizes.empty()) {
+            throw std::invalid_argument("systemone label capacity exceeds the supported size");
+        }
+    }
+
     std::string label(size_t index) const {
         std::string result;
-        size_t remaining = keys.size() - 1;
-        do {
-            result += char('A' + index % 26);
-            index /= 26;
-            remaining /= 26;
-        } while (remaining);
+        for (size_t count : alphabet_sizes) {
+            result += char('A' + index % count);
+            index /= count;
+        }
         return result;
     }
 
@@ -5421,7 +5467,7 @@ void server_routes::init_routes() {
             const std::string prompt = parsed.at("prompt");
             const auto prefix = common_tokenize(ctx_server.vocab, prompt, true, true);
             llama_tokens letters;
-            for (size_t i = 0; i < std::min(size_t(26), question.keys.size()); ++i) {
+            for (size_t i = 0; i < question.alphabet_sizes.back(); ++i) {
                 const std::string label(1, char('A' + i));
                 const auto extended = common_tokenize(ctx_server.vocab, prompt + label, true, true);
                 if (extended.size() != prefix.size() + 1 || !std::equal(prefix.begin(), prefix.end(), extended.begin()) ||
@@ -5437,13 +5483,13 @@ void server_routes::init_routes() {
             } else {
                 tokens = std::move(tokenize_input_prompts(ctx_server.vocab, nullptr, prompt, true, true, ctx_server.init_opt)[0]);
             }
-            const size_t width = question.label(0).size();
+            const size_t width = question.alphabet_sizes.size();
             if (tokens.empty() || tokens.size() + width - 1 >= size_t(meta->slot_n_ctx)) {
                 throw std::invalid_argument("systemone prompt is empty or exceeds the slot context; increase --ctx-size");
             }
             size_t stride = 1;
             for (size_t depth = 0; depth < width; ++depth) {
-                const size_t count = std::min(size_t(26), (question.keys.size() - 1) / stride + 1);
+                const size_t count = question.alphabet_sizes[depth];
                 for (size_t offset = 0; offset < stride && offset < question.keys.size(); ++offset) {
                     server_task task(SERVER_TASK_TYPE_SYSTEMONE);
                     task.id = rd.get_new_id();
@@ -5451,15 +5497,15 @@ void server_routes::init_routes() {
                     task.tokens = tokens.clone();
                     size_t index = offset;
                     for (size_t i = 0; i < depth; ++i) {
-                        task.tokens.push_back(letters[index % 26]);
-                        index /= 26;
+                        task.tokens.push_back(letters[index % question.alphabet_sizes[i]]);
+                        index /= question.alphabet_sizes[i];
                     }
                     task.systemone_tokens.assign(letters.begin(), letters.begin() + count);
                     readouts.push_back({probabilities.size() - 1, offset, stride});
                     tasks.push_back(std::move(task));
                 }
                 if (depth + 1 < width) {
-                    stride *= 26;
+                    stride *= count;
                 }
             }
         }
@@ -5481,7 +5527,7 @@ void server_routes::init_routes() {
             const auto conditional = systemone_question::probabilities(scored->logits);
             auto & joint = probabilities[readout.question];
             for (size_t i = readout.offset; i < joint.size(); i += readout.stride) {
-                joint[i] *= conditional[(i / readout.stride) % 26];
+                joint[i] *= conditional[(i / readout.stride) % conditional.size()];
             }
             input_tokens += scored->n_tokens;
         }
